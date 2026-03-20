@@ -1,0 +1,1 @@
+"""Training package for DIGITAL UNIVERSITY OF KERALA EXTRACTION MODEL."""

@@ -1,0 +1,77 @@
+# ─── DIGITAL UNIVERSITY OF KERALA EXTRACTION MODEL – Default Config ───
+
+# Paths
+data:
+  train_dirs:
+    - data/MAP1
+    - data/MAP2
+  val_dir: null # null → auto-split from train
+  val_split: 0.2
+  tile_size: 512
+  tile_overlap: 64
+  num_workers: 0
+  pin_memory: true
+
+# Model
+model:
+  backbone: sam2
+  sam2_checkpoint: checkpoints/sam2.1_hiera_base_plus.pt
+  sam2_model_cfg: configs/sam2.1/sam2.1_hiera_b+.yaml
+  pretrained: true
+  freeze_encoder: false
+  num_roof_classes: 5 # background + RCC + Tiled + Tin + Others
+  fpn_channels: 256
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine # cosine | step | plateau
+  lr_min: 0.000001
+  warmup_epochs: 5
+  gradient_clip: 0.5
+  mixed_precision: true
+  freeze_backbone_epochs: 3
+  seed: 42
+
+# Loss weights (higher = more emphasis on rare features)
+loss_weights:
+  building: 1.0
+  roof_type: 0.5
+  road: 1.0
+  road_centerline: 1.2
+  waterbody: 1.2
+  waterbody_line: 1.2
+  waterbody_point: 1.5
+  utility_line: 1.2
+  utility_point: 1.3
+  bridge: 1.5
+  railway: 1.3
+
+# Checkpointing
+checkpoint:
+  dir: checkpoints
+  save_top_k: 3
+  metric: avg_iou
+  early_stopping: true
+  patience: 25
+
+# Logging
+logging:
+  dir: logs
+  log_every_n_steps: 50
+  use_wandb: false
+  wandb_project: duk-extraction-model-v1
+  experiment: baseline
+
+# Inference
+inference:
+  tile_size: 512
+  tile_overlap: 64
+  threshold: 0.5
+  min_area: 25 # minimum polygon area in pixels
+  simplify_tolerance: 1.5 # Douglas-Peucker simplification

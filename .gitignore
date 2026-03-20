@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch and Checkpoints
+*.pt
+*.pth
+checkpoints/
+runs/
+
+# Data
+data/
+yolo_dataset/
+*.tif
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.gpkg
+*.geojson
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs
+logs/
+*.log
+tensorboard/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# VSCode / IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,6 @@
+libgl1
+libglib2.0-0
+libgeos-dev
+libgdal-dev
+gdal-bin
+python3-gdal
