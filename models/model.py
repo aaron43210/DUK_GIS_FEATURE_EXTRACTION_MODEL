@@ -5,12 +5,11 @@ Unified segmentation model (SegFormer encoder + UPerNet/FPN decoder).
 This model predicts all raster outputs directly:
 - building_mask, roof_type_mask
 - road_mask, road_centerline_mask
-- waterbody_mask, waterbody_line_mask, waterbody_point_mask
-- utility_line_mask, utility_point_mask
-- bridge_mask, railway_mask
+- waterbody_mask, waterbody_line_mask
+- utility_line_mask
 
-YOLO-based point detections are integrated at inference-time in `inference/predict.py`
-and fused with point masks.
+YOLO-based point detections (Wells, Transformers) are integrated at 
+inference-time in `inference/predict.py`.
 """
 
 import logging
@@ -113,8 +112,7 @@ class EnsembleDUKModel(nn.Module):
         # Iterate through common binary/line tasks
         other_tasks = [
             "road", "road_centerline", "waterbody", "waterbody_line",
-            "waterbody_point", "utility_line", "utility_point",
-            "railway", "bridge"
+            "utility_line", "utility_poly"
         ]
 
         for t in other_tasks:
@@ -150,3 +148,4 @@ class EnsembleDUKModel(nn.Module):
 
 # Final rebranded Alias
 DUKModel = EnsembleDUKModel
+EnsembleSvamitvaModel = EnsembleDUKModel  # Backwards compatibility for legacy training scripts

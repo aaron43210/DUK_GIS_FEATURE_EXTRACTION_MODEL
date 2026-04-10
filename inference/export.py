@@ -1,424 +1,460 @@
 """
-Mask & Detection → GIS Vector (GeoPackage) export module.
+Professional-Grade GIS Vector Export Manager for DUK.
 
-V3 Improvements:
-- Integrated YOLOv8 detection box to GIS point conversion.
-- Consolidated feature mapping for ensemble outputs.
-- Robust geometry cleaning and attribute assignment.
+Restored and optimized version for high-precision building extraction.
+Performs all geometric refinement in pixel space to ensure correct scaling.
+Integrates Shadow-Aware refinement and Watershed Separation.
 """
 
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import cv2
 import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.features import shapes as rasterio_shapes
-from shapely.geometry import LineString, Point, Polygon, MultiPolygon, shape
+from rasterio.features import shapes
+from shapely.affinity import affine_transform
+from shapely.geometry import Point, Polygon, LineString, shape
+from shapely.ops import unary_union
 
-from inference.postprocess import (
-    get_threshold,
-    prune_skeleton,
-    refine_line,
+from .postprocess import (
     refine_mask,
+    separate_instances,
     refine_polygon,
+    refine_line,
     snap_line_endpoints,
+    get_threshold,
+    SAM2Refiner,
+    GlobalAligner,
+    ShadowDetector,
+    orthogonalize_polygon,
+    ROOF_LABELS,
+    ROOF_COLORS_HEX,
 )
 
 logger = logging.getLogger(__name__)
 
-# GIS Attribute Labels
-ROOF_LABELS = ["Background", "RCC", "Tiled", "Tin", "Others"]
-
-# Feature Optimization Settings
-FEATURE_CONFIG: Dict[str, Dict[str, Any]] = {
-    "building_mask": {
-        "name": "Built-up_Area",
-        "type": "Polygon",
-        "min_area": 15,
-        "simplify": 0.5,
-    },
-    "roof_type_mask": {
-        "name": "Roof_Classification",
-        "type": "Polygon",
-        "min_area": 10,
-        "simplify": 0.5,
-    },
-    "road_mask": {"name": "Road", "type": "Polygon", "min_area": 30, "simplify": 0.8},
-    "road_centerline_mask": {
-        "name": "Road_Centre_Line",
-        "type": "LineString",
-        "min_length": 5,
-        "simplify": 0.5,
-    },
-    "waterbody_mask": {
-        "name": "Water_Body",
-        "type": "Polygon",
-        "min_area": 25,
-        "simplify": 1.0,
-    },
-    "waterbody_line_mask": {
-        "name": "Water_Body_Line",
-        "type": "LineString",
-        "min_length": 5,
-        "simplify": 0.5,
-    },
-    "waterbody_point_mask": {"name": "Well", "type": "Point"},
-    "utility_line_mask": {
-        "name": "Utility_Pipeline_Wires",
-        "type": "LineString",
-        "min_length": 5,
-        "simplify": 0.5,
-    },
-    "utility_point_mask": {"name": "Utility_Point_Generic", "type": "Point"},
-    "utility_transformer_mask": {"name": "Transformer", "type": "Point"},
-    "bridge_mask": {
-        "name": "Bridge",
-        "type": "Polygon",
-        "min_area": 20,
-        "simplify": 0.5,
-    },
-    "railway_mask": {
-        "name": "Railway",
-        "type": "LineString",
-        "min_length": 10,
-        "simplify": 1.0,
-    },
-}
-
-# YOLO Class Mapping (used for point categorization)
-YOLO_CLASS_INFO = {
-    0: {"name": "Well", "key": "waterbody_point_mask"},
-    1: {"name": "Transformer", "key": "utility_transformer_mask"},
+# ─────────────────────────────────────────────────────────────────────
+# Feature Configuration — all 9 GIS layers
+# ─────────────────────────────────────────────────────────────────────
+FEATURE_CONFIG: Dict[str, dict] = {
+    # ── SegFormer segmentation outputs ────────────────────────────
+    "building_mask": {"name": "Buildings", "type": "Polygon"},
+    "road_mask": {"name": "Roads", "type": "Polygon"},
+    "road_centerline_mask": {"name": "Road_Centrelines", "type": "LineString"},
+    "waterbody_mask": {"name": "Water_Polygons", "type": "Polygon"},
+    "waterbody_line_mask": {"name": "Water_Lines", "type": "LineString"},
+    # ── YOLO point detection outputs ──────────────────────────────
+    "waterbody_point_mask": {"name": "Wells", "type": "Point"},
+    "utility_transformer_mask": {"name": "Transformers", "type": "Point"},
+    "overhead_tank_mask": {"name": "Overhead_Tanks", "type": "Point"},
 }
 
 
-def _mask_to_geometries(
-    mask: np.ndarray,
+# ROOF_LABELS and ROOF_COLORS_HEX are now imported from postprocess.py
+# for single-source-of-truth consistency.
+
+
+def _merge_point_blobs(
+    geoms: List[Any],
+    nms_radius_px: float,
     transform: rasterio.Affine,
-    threshold: float = 0.5,
-    geom_type: str = "Polygon",
-    min_val: float = 20.0,
-    simplify_tol: float = 0.5,
-    feature_key: str = "",
-) -> list:
-    """Convert mask to cleaned shapely geometries with post-processing."""
-    binary = (mask > threshold).astype(np.uint8)
-    if binary.sum() == 0:
-        return []
-
-    # ── Stage 1: Mask-level morphological refinement ──
-    binary = refine_mask(binary, feature_key)
-    if binary.sum() == 0:
-        return []
-
-    if geom_type == "LineString":
-        from skimage.morphology import skeletonize
-
-        skeleton = skeletonize(binary)
-
-        # ── Stage 2: Skeleton pruning (remove spurious branches) ──
-        skeleton = prune_skeleton(skeleton, feature_key)
-
-        shapes = list(
-            rasterio_shapes(
-                skeleton.astype(np.uint8), mask=skeleton > 0, transform=transform
-            )
-        )
-        geoms = [shape(g) for g, v in shapes if v > 0]
-        geoms = [g for g in geoms if g.length > min_val]
-
-        # ── Stage 3: Chaikin smoothing on each line ──
-        geoms = [
-            refine_line(g, feature_key) if isinstance(g, LineString) else g
-            for g in geoms
-        ]
-
-        # ── Stage 4: Dead-end snapping (connect broken endpoints) ──
-        geoms = snap_line_endpoints(geoms, feature_key)
-
+) -> List[Any]:
+    """
+    Spatial NMS for point features: merge duplicate detections
+    (multiple YOLO boxes from overlapping tiles) into one centroid.
+    Operates in GIS coordinate space.
+    """
+    if len(geoms) <= 1:
         return geoms
+    # Convert NMS radius from pixels to GIS units using pixel size
+    pixel_size = abs(transform.a)  # metres per pixel
+    radius_m = nms_radius_px * pixel_size
 
-    elif geom_type == "Polygon":
-        shapes = list(rasterio_shapes(binary, mask=binary > 0, transform=transform))
-        geoms = []
-        for g, v in shapes:
-            poly = shape(g)
-            if poly.area < min_val:
-                continue
-            if simplify_tol > 0:
-                poly = poly.simplify(simplify_tol, preserve_topology=True)
-            if not poly.is_empty and poly.is_valid:
-                # ── Stage 3: Polygon refinement (orthogonalize / smooth) ──
-                poly = refine_polygon(poly, feature_key)
-                if not poly.is_empty and poly.is_valid:
-                    geoms.append(poly)
-        return geoms
-
-    elif geom_type == "Point":
-        from skimage.measure import label, regionprops
-
-        labels = label(binary)
-        # centroids are (row, col) i.e (y, x), needs to be (x, y) for transform
-        return [
-            Point(transform * (prop.centroid[1], prop.centroid[0]))
-            for prop in regionprops(labels)
-        ]
-
-    return []
-
-
-def _roof_mask_to_records(
-    roof_mask: np.ndarray,
-    transform: rasterio.Affine,
-    min_area: float = 10.0,
-    simplify_tol: float = 0.5,
-) -> List[Dict[str, Any]]:
-    """Convert class-index roof mask to polygon records with roof_type labels."""
-    records: List[Dict[str, Any]] = []
-    for class_id in range(1, min(len(ROOF_LABELS), 5)):
-        binary = (roof_mask == class_id).astype(np.uint8)
-        if binary.sum() == 0:
+    kept: List[Any] = []
+    suppressed = [False] * len(geoms)
+    for i, g in enumerate(geoms):
+        if suppressed[i]:
             continue
-        shapes = list(rasterio_shapes(binary, mask=binary > 0, transform=transform))
-        for geom_raw, val in shapes:
-            if val <= 0:
-                continue
-            poly = shape(geom_raw)
-            if poly.area < min_area:
-                continue
-            if simplify_tol > 0:
-                poly = poly.simplify(simplify_tol, preserve_topology=True)
-            if poly.is_empty or not poly.is_valid:
-                continue
-            records.append(
-                {
-                    "geometry": poly,
-                    "class": "Roof_Types",
-                    "roof_type": ROOF_LABELS[class_id],
-                }
-            )
-    return records
+        cluster = [g]
+        for j in range(i + 1, len(geoms)):
+            if not suppressed[j] and g.distance(geoms[j]) <= radius_m:
+                cluster.append(geoms[j])
+                suppressed[j] = True
+        # Centroid of cluster
+        xs = [p.x for p in cluster]
+        ys = [p.y for p in cluster]
+        kept.append(Point(sum(xs) / len(xs), sum(ys) / len(ys)))
+    return kept
 
 
-class GISExporter:
-    """Production exporter for ensemble V3 predictions."""
+class ExportManager:
+    """Orchestrates the conversion from probability rasters to refined GIS vector files."""
 
     def __init__(
         self,
         output_dir: Path,
         crs: Any,
-        default_threshold: float = 0.5,
-        task_thresholds: Optional[Dict[str, float]] = None,
-        export_format: str = "GPKG",  # 'GPKG' or 'SHP'
+        transform: rasterio.Affine,
+        export_format: str = "GPKG",
+        use_sam: bool = False,
+        device: str = "cpu",
     ):
-        self.output_dir = Path(output_dir)
+        self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.crs = crs
-        self.default_threshold = float(default_threshold)
-        self.task_thresholds = task_thresholds or {}
+        self.transform = transform
+        self.shapely_transform = (
+            transform.a,
+            transform.b,
+            transform.d,
+            transform.e,
+            transform.xoff,
+            transform.yoff,
+        )
         self.export_format = export_format.upper()
+        self.use_sam = use_sam
+        self.sam_refiner = SAM2Refiner(device=device) if use_sam else None
+        self.global_aligner = GlobalAligner()
+        self.shadow_detector = ShadowDetector()
 
-    def _get_threshold(self, key: str) -> float:
-        return float(self.task_thresholds.get(key, self.default_threshold))
+    def _mask_to_geometries(
+        self,
+        prob_map: np.ndarray,
+        feature_key: str,
+        image_rgb: Optional[np.ndarray] = None,
+        shadow_mask: Optional[np.ndarray] = None,
+    ) -> List[Any]:
+        """Convert a probability map to refined Shapely geometries (Pixel-space logic)."""
+        threshold = get_threshold(feature_key)
+        binary_mask = (prob_map >= threshold).astype(np.uint8)
+
+        # 1. Mask-level cleanup
+        refined_mask = refine_mask(binary_mask, feature_key, prob_map=prob_map)
+        if refined_mask.sum() == 0:
+            return []
+
+        geoms = []
+        if FEATURE_CONFIG[feature_key]["type"] == "Point":
+            labeled = separate_instances(refined_mask, feature_key)
+            for i in range(1, labeled.max() + 1):
+                rows, cols = np.where(labeled == i)
+                if len(rows) > 0:
+                    cy, cx = np.mean(rows), np.mean(cols)
+                    geoms.append(Point(self.transform * (cx, cy)))
+        else:
+            # 2. Instance-level Vectorization & SAM Snapping
+            labeled = separate_instances(refined_mask, feature_key)
+            num_instances = labeled.max()
+
+            pixel_geoms = []
+            for i in range(1, num_instances + 1):
+                inst_mask = (labeled == i).astype(np.uint8)
+
+                # BUILDING FOCUS: Skip tiny noise (smaller than 15sqm approx)
+                if feature_key == "building_mask" and inst_mask.sum() < 100:
+                    continue
+
+                # Professional Snapping (SAM 2.1)
+                if (
+                    self.use_sam
+                    and feature_key == "building_mask"
+                    and image_rgb is not None
+                ):
+                    inst_mask = self.sam_refiner.refine_building(
+                        image_rgb, inst_mask, shadow_mask=shadow_mask
+                    )
+
+                # Vectorize in PIXELS
+                inst_shapes = shapes(inst_mask, mask=(inst_mask > 0))
+                for s, v in inst_shapes:
+                    if v > 0:
+                        pixel_geoms.append(shape(s))
+
+            # 3. Geometry-level refinement
+            if FEATURE_CONFIG[feature_key]["type"] == "Polygon":
+                if feature_key == "building_mask" and len(pixel_geoms) > 1:
+                    # 3.1 Adaptive Merging (STOPS STRIPS)
+                    # Fuse polygons that are nearly touching and part of the same structure
+                    from shapely.ops import unary_union
+
+                    # Buffer 2px to bridge gaps, union, then unbuffer
+                    merged = unary_union(
+                        [p.buffer(2) for p in pixel_geoms if isinstance(p, Polygon)]
+                    )
+                    if isinstance(merged, Polygon):
+                        pixel_geoms = [merged.buffer(-1.5)]  # Shrink slightly back
+                    else:
+                        # Multi-polygon: split back to individual pieces
+                        pixel_geoms = [
+                            p.buffer(-1.5)
+                            for p in list(merged.geoms)
+                            if not p.buffer(-1.5).is_empty
+                        ]
+
+                    # GIS Engineering: Hough-Guided Visual Locking
+                    # Get dominant village angle for fallback
+                    village_angles = self.global_aligner.find_dominant_village_angles(
+                        pixel_geoms
+                    )
+                    dominant_rad = (
+                        np.radians(village_angles[0]) if village_angles else None
+                    )
+
+                    for g in pixel_geoms:
+                        if isinstance(g, Polygon):
+                            # Extract local RGB tile for this specific building
+                            tile = None
+                            if image_rgb is not None:
+                                bounds = g.bounds
+                                y1, x1, y2, x2 = map(
+                                    int,
+                                    [
+                                        bounds[1] - 10,
+                                        bounds[0] - 10,
+                                        bounds[3] + 10,
+                                        bounds[2] + 10,
+                                    ],
+                                )
+                                h, w = image_rgb.shape[:2]
+                                tile = image_rgb[
+                                    max(0, y1) : min(h, y2), max(0, x1) : min(w, x2)
+                                ]
+
+                            # Force building to snap to its own visual lines (Hough)
+                            # or fallback to village grid
+                            refined = orthogonalize_polygon(
+                                g, dominant_angle_override=dominant_rad, image_tile=tile
+                            )
+                            if not refined.is_empty:
+                                geoms.append(
+                                    affine_transform(refined, self.shapely_transform)
+                                )
+                else:
+                    for g in pixel_geoms:
+                        if isinstance(g, Polygon):
+                            refined = refine_polygon(g, feature_key)
+                            if not refined.is_empty:
+                                geoms.append(
+                                    affine_transform(refined, self.shapely_transform)
+                                )
+            else:
+                for g in pixel_geoms:
+                    if isinstance(g, LineString):
+                        refined = refine_line(g, feature_key)
+                        if not refined.is_empty:
+                            geoms.append(
+                                affine_transform(refined, self.shapely_transform)
+                            )
+                geoms = snap_line_endpoints(geoms, feature_key)
+
+        return geoms
 
     def export(
         self,
-        results: Dict[str, Any],
+        results: Dict[str, np.ndarray],
         roof_mask: Optional[np.ndarray] = None,
-        transform: Optional[rasterio.Affine] = None,
+        image_rgb: Optional[np.ndarray] = None,
     ) -> Dict[str, Path]:
-        """Main export loop handling both segmentation and detection."""
-        exported_paths = {}
-        if transform is None:
-            logger.error("Transform is required for export.")
-            return {}
+        """Process all results and write to disk."""
+        exported_files = {}
 
-        # Auto-detect roof mask in results if possible
-        if roof_mask is None and "roof_type_mask" in results:
-            roof_mask = results["roof_type_mask"]
+        # Pre-detect shadows if image is available
+        shadow_mask = None
+        if image_rgb is not None:
+            logger.info("Detecting shadow regions for boundary pruning...")
+            shadow_mask = self.shadow_detector.get_shadow_mask(image_rgb)
 
-        # 1. Process Segmentation Masks
-        for key, config in FEATURE_CONFIG.items():
-            if key not in results or not isinstance(results[key], np.ndarray):
+        # Pre-calculate road union for clipping buildings (GIS Engineering)
+        road_union = None
+        if "road_mask" in results:
+            road_prob = results["road_mask"]
+            road_bin = (road_prob >= get_threshold("road_mask")).astype(np.uint8)
+            road_shapes = shapes(road_bin, mask=(road_bin > 0))
+            road_geoms = [shape(s) for s, v in road_shapes if v > 0]
+            if road_geoms:
+                road_union = unary_union(road_geoms)
+
+        for key, prob in results.items():
+            if key == "detections" or key == "roof_type_mask":
+                continue
+            if key not in FEATURE_CONFIG:
                 continue
 
-            logger.info("Vectorizing %s...", config["name"])
-            mask = results[key]
+            config = FEATURE_CONFIG[key]
+            logger.info(f"Exporting professional layer: {config['name']}")
 
-            if key == "roof_type_mask":
-                records = _roof_mask_to_records(
-                    mask,
-                    transform,
-                    min_area=float(config.get("min_area", 10)),
-                    simplify_tol=float(config.get("simplify", 0.5)),
-                )
-                if records:
-                    exported_paths[key] = self._write_records(
-                        records, config["name"]
-                    )
-                continue
-
-            # Use per-class adaptive threshold from postprocess config
-            adaptive_thresh = get_threshold(key)
-            fallback_thresh = self._get_threshold(key)
-            threshold = adaptive_thresh if adaptive_thresh != 0.5 else fallback_thresh
-
-            geoms = _mask_to_geometries(
-                mask,
-                transform,
-                threshold=threshold,
-                geom_type=str(config["type"]),
-                min_val=float(config.get("min_area", config.get("min_length", 0))),
-                simplify_tol=float(config.get("simplify", 0)),
-                feature_key=key,
+            geoms = self._mask_to_geometries(
+                prob, key, image_rgb=image_rgb, shadow_mask=shadow_mask
             )
 
-            if geoms:
-                exported_paths[key] = self._write_gpkg(
-                    geoms, config["name"], key, transform, roof_mask
-                )
+            # REAL WORLD: Clip buildings by roads to prevent overlaps
+            if key == "building_mask" and road_union is not None:
+                clipped_geoms = []
+                for g in geoms:
+                    # Work in GIS space for clipping
+                    if g.intersects(road_union):
+                        g = g.difference(road_union)
+                    if not g.is_empty:
+                        clipped_geoms.append(g)
+                geoms = clipped_geoms
 
-        # 2. Process YOLO Detections
-        if "detections" in results:
-            logger.info("Processing YOLOv8 detections...")
-            det_by_key: Dict[str, List[Dict[str, Any]]] = {}
-            for det in results["detections"]:
-                info = YOLO_CLASS_INFO.get(det["class"])
-                if info:
-                    key = info["key"]
-                    if key not in det_by_key:
-                        det_by_key[key] = []
+            if not geoms:
+                continue
 
-                    x1, y1, x2, y2 = det["box"]
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    world_pt = Point(transform * (cx, cy))
+            records = []
+            for i, g in enumerate(geoms):
+                data = {"geometry": g, "id": i, "feature": config["name"]}
 
-                    det_by_key[key].append(
-                        {
-                            "geometry": world_pt,
-                            "label": det.get("label", info["name"]),
-                            "confidence": det.get("conf", 0.0),
-                        }
+                if key == "building_mask":
+                    inv_transform = ~self.transform
+                    roof_label = self._classify_building_roof(
+                        g, inv_transform, roof_mask, image_rgb
+                    )
+                    data["roof_type"] = roof_label
+                    data["roof_color"] = ROOF_COLORS_HEX.get(
+                        roof_label, "#CCCCCC"
                     )
 
-            for key, items in det_by_key.items():
-                name = FEATURE_CONFIG[key]["name"]
-                exported_paths[f"det_{key}"] = self._write_records(items, name)
+                records.append(data)
 
-        return exported_paths
+            gdf = gpd.GeoDataFrame(records, crs=self.crs)
+            if not gdf.empty:
+                if config["type"] == "Polygon":
+                    gdf["Area_SqM"] = gdf.geometry.area
+                elif config["type"] == "LineString":
+                    gdf["Length_M"] = gdf.geometry.length
 
-    def _write_records(self, records: List[Dict[str, Any]], layer_name: str) -> Path:
-        """Write pre-built records to a GeoPackage or Shapefile layer."""
-        for i, row in enumerate(records):
-            if "id" not in row:
-                row["id"] = i
+            ext = "shp" if self.export_format == "SHP" else "gpkg"
+            file_name = f"{config['name']}.{ext}"
+            out_path = self.output_dir / file_name
 
-        gdf = gpd.GeoDataFrame(records, crs=self.crs)
+            if self.export_format == "SHP":
+                gdf.to_file(out_path)
+            else:
+                gdf.to_file(out_path, driver="GPKG", layer=config["name"])
 
-        # Standard attribute enrichment
-        if not gdf.empty:
-            # Add feature class if missing
-            if "feature" not in gdf.columns:
-                gdf["feature"] = layer_name
+            exported_files[key] = out_path
+            logger.info(f"  Saved {len(gdf)} features to {file_name}")
 
-            # Geometry units
-            if "Polygon" in str(gdf.geometry.iloc[0].geom_type):
-                gdf["Area_SqM"] = gdf.geometry.area
-            elif "LineString" in str(gdf.geometry.iloc[0].geom_type):
-                gdf["Length_M"] = gdf.geometry.length
+            # Generate QML categorized style for buildings
+            if key == "building_mask" and roof_mask is not None:
+                qml_path = self.output_dir / f"{config['name']}.qml"
+                _write_building_qml(qml_path)
+                logger.info(f"  Style file: {qml_path.name}")
 
-        # Sanitize layer name for safe file path
-        safe_name = "".join(
-            c for c in layer_name if c.isalnum() or c in ("_", "-", ".")
+        return exported_files
+
+    def _classify_building_roof(
+        self,
+        geom: Polygon,
+        inv_transform,
+        roof_mask: Optional[np.ndarray],
+        image_rgb: Optional[np.ndarray],
+    ) -> str:
+        """
+        Classify a building's roof using high-fidelity majority voting from the NN predictions.
+        (Spectral HSV analysis removed for increased robustness to lighting variations).
+        """
+        if roof_mask is None:
+            return ROOF_LABELS.get(0, "Incomplete")
+            
+        return self._get_majority_nn_roof(geom, roof_mask, inv_transform)
+
+    def _get_majority_nn_roof(self, geom, roof_mask, inv_transform) -> str:
+        """Internal helper for NN majority vote."""
+        try:
+            from rasterio.features import rasterize
+            from shapely.affinity import affine_transform as sat
+            bounds = geom.bounds
+            px_min_x, px_min_y = inv_transform * (bounds[0], bounds[3])
+            px_max_x, px_max_y = inv_transform * (bounds[2], bounds[1])
+            r0, r1 = max(0, int(px_min_y)), int(px_max_y) + 1
+            c0, c1 = max(0, int(px_min_x)), int(px_max_x) + 1
+            
+            roi = roof_mask[r0:r1, c0:c1]
+            px_geom = sat(geom, [
+                inv_transform.a, inv_transform.b,
+                inv_transform.d, inv_transform.e,
+                inv_transform.xoff - c0, inv_transform.yoff - r0,
+            ])
+            mask = rasterize([(px_geom, 1)], out_shape=roi.shape, fill=0, dtype=np.uint8)
+            values = roi[mask > 0]
+            if len(values) == 0: return "Unknown"
+            unique, counts = np.unique(values, return_counts=True)
+            return ROOF_LABELS.get(int(unique[np.argmax(counts)]), "Unknown")
+        except: return "Unknown"
+
+
+
+def _write_building_qml(qml_path: Path) -> None:
+    """Generate a QGIS categorized renderer style file for roof types."""
+    categories = []
+    for label_name, hex_color in ROOF_COLORS_HEX.items():
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        categories.append(
+            f'      <category symbol="{label_name}" '
+            f'value="{label_name}" label="{label_name}" render="true"/>'
         )
 
-        if self.export_format == "SHP":
-            out_path = self.output_dir / f"{safe_name}.shp"
-            gdf.to_file(out_path)
-        else:
-            out_path = self.output_dir / f"{safe_name}.gpkg"
-            gdf.to_file(out_path, driver="GPKG")
+    symbols = []
+    for i, (label_name, hex_color) in enumerate(ROOF_COLORS_HEX.items()):
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        symbols.append(f'''      <symbol name="{label_name}" type="fill" alpha="0.75">
+        <layer class="SimpleFill" enabled="1">
+          <prop k="color" v="{r},{g},{b},190"/>
+          <prop k="outline_color" v="35,35,35,255"/>
+          <prop k="outline_width" v="0.26"/>
+          <prop k="style" v="solid"/>
+        </layer>
+      </symbol>''')
 
-        logger.info("  Saved %d features to %s", len(gdf), out_path.name)
-        return out_path
-
-    def _write_gpkg(
-        self,
-        geoms: list,
-        name: str,
-        key: str,
-        transform: rasterio.Affine,
-        roof_mask: Optional[np.ndarray] = None,
-    ) -> Path:
-        """Helper to write GDF to GeoPackage."""
-        records = []
-        for i, g in enumerate(geoms):
-            # Polygon orientation/topology cleaning
-            if isinstance(g, (Polygon, MultiPolygon)) and not g.is_valid:
-                g = g.buffer(0)
-
-            data = {"geometry": g, "id": i, "class": name}
-
-            # Roof Attribute logic (Specific to buildings)
-            if key == "building_mask" and roof_mask is not None:
-                cp = g.representative_point()
-                inv_transform = ~transform
-                px, py = inv_transform * (cp.x, cp.y)
-                r, c = int(py), int(px)
-                if 0 <= r < roof_mask.shape[0] and 0 <= c < roof_mask.shape[1]:
-                    idx = int(roof_mask[r, c])
-                    data["roof_type"] = ROOF_LABELS[min(idx, 4)]
-
-            records.append(data)
-
-        gdf = gpd.GeoDataFrame(records, crs=self.crs)
-
-        # Standard attribute enrichment
-        if not gdf.empty:
-            if "feature" not in gdf.columns:
-                gdf["feature"] = name
-            if "Polygon" in str(gdf.geometry.iloc[0].geom_type):
-                gdf["Area_SqM"] = gdf.geometry.area
-            elif "LineString" in str(gdf.geometry.iloc[0].geom_type):
-                gdf["Length_M"] = gdf.geometry.length
-
-        if self.export_format == "SHP":
-            out_path = self.output_dir / f"{name}.shp"
-            gdf.to_file(out_path)
-        else:
-            out_path = self.output_dir / f"{name}.gpkg"
-            gdf.to_file(out_path, driver="GPKG")
-
-        logger.info("  Saved %d features to %s", len(gdf), out_path.name)
-        return out_path
+    qml_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<qgis version="3.28">
+  <renderer-v2 type="categorizedSymbol" attr="roof_type"
+               enableorderby="0" symbollevels="0">
+    <categories>
+{chr(10).join(categories)}
+    </categories>
+    <symbols>
+{chr(10).join(symbols)}
+    </symbols>
+  </renderer-v2>
+  <labeling type="simple">
+    <settings>
+      <text-style fieldName="roof_type" fontSize="8"
+                  fontFamily="Arial" fontWeight="50"/>
+    </settings>
+  </labeling>
+</qgis>
+'''
+    qml_path.write_text(qml_content, encoding="utf-8")
 
 
 def export_predictions(
-    results: Dict[str, Any],
-    tif_path: Path,
-    output_dir: Path,
-    threshold: Union[float, Dict[str, float]] = 0.5,
-    roof_type_mask: Optional[np.ndarray] = None,
+    results: Dict[str, np.ndarray],
+    tif_path: Union[str, Path],
+    output_dir: Union[str, Path],
+    roof_mask: Optional[np.ndarray] = None,
     export_format: str = "GPKG",
+    image_rgb: Optional[np.ndarray] = None,
+    use_sam: bool = False,
+    device: str = "cpu",
 ) -> Dict[str, Path]:
-    """Compatibility wrapper."""
-    if isinstance(threshold, dict):
-        default_threshold = 0.5
-        task_thresholds = threshold
-    else:
-        default_threshold = float(threshold)
-        task_thresholds = None
-
-    with rasterio.open(tif_path) as src:
-        exporter = GISExporter(
-            output_dir,
-            src.crs,
-            default_threshold=default_threshold,
-            task_thresholds=task_thresholds,
+    """Top-level entry point for QGIS integration."""
+    with rasterio.open(str(tif_path)) as src:
+        manager = ExportManager(
+            output_dir=Path(output_dir),
+            crs=src.crs,
+            transform=src.transform,
             export_format=export_format,
+            use_sam=use_sam,
+            device=device,
         )
-        return exporter.export(
-            results, roof_mask=roof_type_mask, transform=src.transform
-        )
+        return manager.export(results, roof_mask=roof_mask, image_rgb=image_rgb)

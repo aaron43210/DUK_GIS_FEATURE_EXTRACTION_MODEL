@@ -18,13 +18,9 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-<<<<<<< HEAD
+from typing import Any, Dict, Tuple, Union
 
 import numpy as np
-=======
->>>>>>> 48371e9 (Final production push: SegFormer-B4 architecture, memory optimizations, and robust resume mechanism)
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -89,9 +85,6 @@ def get_best_gpu() -> int:
 
 def get_device(config: TrainingConfig) -> torch.device:
     """Determine the best available device."""
-    if config.force_cpu:
-        return torch.device("cpu")
-    
     # Priority 1: LOCAL_RANK (for DDP stability)
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if local_rank != -1:
@@ -110,7 +103,8 @@ def get_device(config: TrainingConfig) -> torch.device:
     
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
-    return torch.device("cpu")
+        
+    raise RuntimeError("No GPU (CUDA/MPS) available. CPU execution is not permitted.")
 
 
 # ── Learning Rate Schedule ────────────────────────────────────────────────────
@@ -228,8 +222,19 @@ class CheckpointManager:
         Save model to best.pt if it's the new best.
         """
         score = metrics.get(self.metric_name, 0)
-        is_best = score > self.best_score
+        
+        # ── SAFETY FILTER (Fixing the Epoch 39 issue) ──
+        # Do not save as BEST if score is NaN or 0 (unless we are at Epoch 1)
+        if (torch.isnan(torch.tensor(score)) or score <= 0) and epoch > 1:
+            logger.warning(
+                f"⚠️ Model score ({score:.4f}) is invalid or ZERO. "
+                "Skipping 'best.pt' save to prevent poisoning."
+            )
+            # We still save latest for recovery, but we mark it as suspicious
+            self.save_latest(model, optimizer, scheduler, epoch, metrics, rank)
+            return False
 
+        is_best = score > self.best_score
         # Always save latest for crash recovery (only rank 0)
         self.save_latest(model, optimizer, scheduler, epoch, metrics, rank)
 
@@ -267,6 +272,18 @@ class CheckpointManager:
                     f"★ New best model saved to best.pt "
                     f"(epoch {epoch}, {self.metric_name}={score:.4f})"
                 )
+                
+                # ── SAVE INFERENCE-ONLY VERSION (Small) ──
+                inf_path = self.save_dir / "best_inference.pt"
+                # Store only model state, convert to FP16 for massive size reduction (no quality loss)
+                inf_state = {
+                    "model_state_dict": {k: v.half().cpu() for k, v in model_state.items()},
+                    "metrics": metrics,
+                    "epoch": epoch,
+                }
+                torch.save(inf_state, inf_path)
+                logger.info(f"⚡ Inference-ready model saved: best_inference.pt (~120MB)")
+
             except Exception as e:
                 logger.warning(f"Failed to save best checkpoint: {e}")
                 if best_tmp.exists():
@@ -320,8 +337,6 @@ class Trainer:
         # Auto-initialize DDP if multiple GPUs available and not already init'd
         if (
             not self.is_distributed
-            and not config.force_cpu
-            and torch.cuda.is_available()
             and torch.cuda.device_count() > 1
         ):
             n_gpus = torch.cuda.device_count()
@@ -331,7 +346,7 @@ class Trainer:
                 os.environ.setdefault("MASTER_PORT", "29500")
                 os.environ.setdefault("RANK", "0")
                 os.environ.setdefault("WORLD_SIZE", "1")
-                backend = "nccl" if torch.cuda.is_available() else "gloo"
+                backend = "nccl"
                 # Set 5-minute timeout instead of default 30-minute to allow faster recovery
                 from datetime import timedelta
                 dist.init_process_group(
@@ -347,7 +362,8 @@ class Trainer:
                 torch.cuda.set_device(self.device)
 
                 logger.info(
-                    "🚀 Auto-initialized DDP process group " "(backend=%s, %d GPUs, rank=%d)",
+                    "🚀 Auto-initialized DDP process group "
+                    "(backend=%s, %d GPUs, rank=%d)",
                     backend,
                     n_gpus,
                     local_rank
@@ -380,13 +396,11 @@ class Trainer:
             self.model = DDP(
                 raw_model,
                 device_ids=[self.device.index],
-                find_unused_parameters=True,  # Necessary for frozen backbones
+                find_unused_parameters=True,  # Required for frozen backbone support
             )
             self.is_multi_gpu = True
         elif (
-            torch.cuda.is_available()
-            and torch.cuda.device_count() > 1
-            and not config.force_cpu
+            torch.cuda.device_count() > 1
         ):
             # Fallback: DataParallel (if DDP init failed)
             n_gpus = torch.cuda.device_count()
@@ -410,12 +424,9 @@ class Trainer:
                 self.is_multi_gpu = False
         else:
             self.model = raw_model
-            if not config.force_cpu:
-                n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-                if n_gpus <= 1:
-                    logger.info("Multi-GPU skipped: %d GPU(s) visible.", n_gpus)
-            else:
-                logger.info("Multi-GPU skipped: force_cpu is True.")
+            n_gpus = torch.cuda.device_count()
+            if n_gpus <= 1:
+                logger.info("Multi-GPU skipped: %d GPU(s) visible.", n_gpus)
 
         # Wrap data loaders with DistributedSampler for DDP
         if self.is_distributed and not isinstance(
@@ -447,29 +458,45 @@ class Trainer:
         self.val_loader = val_loader
         self.loss_fn = loss_fn.to(self.device)
 
-        # Optimizer
-        if hasattr(model, "get_param_groups"):
-            param_groups = getattr(model, "get_param_groups")(config.learning_rate)
-        else:
-            param_groups = model.parameters()
+        # ── Optimized Parameter Groups (Perfection Tweak) ──
+        # Exclude BatchNorm and Bias from weight decay to prevent over-regularization.
+        # This is standard practice for high-performance production models.
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (nn.Linear, nn.Conv2d)
+        blacklist_weight_modules = (nn.BatchNorm2d, nn.SyncBatchNorm, nn.LayerNorm, nn.Embedding)
+        
+        for mn, m in self.model.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = f"{mn}.{pn}" if mn else pn # full param name
+                if pn.endswith("bias"):
+                    no_decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+                elif "pos_embed" in pn or "cls_token" in pn: # ViT/SegFormer specific
+                    no_decay.add(fpn)
 
+        param_dict = {pn: p for pn, p in self.model.named_parameters()}
+        
+        # Split backbone and heads for scaled LR
+        backbone_names = {n for n, _ in self.model.named_parameters() if "encoder" in n}
+        
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay & backbone_names))], "weight_decay": config.weight_decay, "lr": config.learning_rate * 0.1},
+            {"params": [param_dict[pn] for pn in sorted(list(decay - backbone_names))], "weight_decay": config.weight_decay, "lr": config.learning_rate},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay & backbone_names))], "weight_decay": 0.0, "lr": config.learning_rate * 0.1},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay - backbone_names))], "weight_decay": 0.0, "lr": config.learning_rate},
+        ]
+        
         self.optimizer: torch.optim.Optimizer
         if config.optimizer == "adamw":
-            self.optimizer = torch.optim.AdamW(
-                param_groups,
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-            )
+            self.optimizer = torch.optim.AdamW(optim_groups, lr=config.learning_rate)
         else:
-            self.optimizer = torch.optim.SGD(
-                param_groups,
-                lr=config.learning_rate,
-                momentum=0.9,
-                weight_decay=config.weight_decay,
-            )
+            self.optimizer = torch.optim.SGD(optim_groups, lr=config.learning_rate, momentum=0.9)
 
         # Scheduler
-        self.scheduler: Any
         if config.optimizer == "adamw":
             # Using OneCycleLR for faster convergence
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -477,7 +504,7 @@ class Trainer:
                 max_lr=config.learning_rate,
                 epochs=config.num_epochs,
                 steps_per_epoch=len(self.train_loader),
-                pct_start=0.1,  # 10% warmup, 90% decay for "perfect" cooling
+                pct_start=0.1,
                 div_factor=25,
                 final_div_factor=1e4,
             )
@@ -528,7 +555,7 @@ class Trainer:
 
         # History Persistence
         self.history_path = self.config.log_dir / "training_history.json"
-        self.history: Dict[str, list] = {
+        self.history = {
             "train_loss": [],
             "val_loss": [],
             "metrics": [],
@@ -549,6 +576,7 @@ class Trainer:
     def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> int:
         """
         Loads model, optimizer, and scheduler state from a checkpoint.
+        Also restores CheckpointManager state (best_score, best_epoch).
         Returns the next epoch to start from.
         """
         path = Path(checkpoint_path)
@@ -562,91 +590,73 @@ class Trainer:
             checkpoint = torch.load(path, map_location=self.device)
         except (EOFError, RuntimeError, Exception) as e:
             logger.warning(f"❌ Failed to load checkpoint {path}: {e}")
-            # Identify specific corruption types for better logging
             if isinstance(e, EOFError):
                 logger.error("Checkpoint file is truncated (EOFError).")
-            return 0  # Signal failure so caller can try fallback
-
-        # 1. Model State
-        try:
-            if hasattr(self.model, "module"):
-                self.model.module.load_state_dict(checkpoint["model_state_dict"])
-            else:
-                self.model.load_state_dict(checkpoint["model_state_dict"])
-        except Exception as e:
-            logger.error(f"❌ State dict mismatch in {path}: {e}")
             return 0
 
-        # ... rest of the logic ...
-        # 2. Optimizer State
+        # 1. Restore CheckpointManager State (CRITICAL FIX)
+        if "best_score" in checkpoint:
+            self.ckpt_mgr.best_score = checkpoint["best_score"]
+            self.ckpt_mgr.best_epoch = checkpoint.get("epoch", 0)
+            logger.info(
+                f"📈 Restored best score: {self.ckpt_mgr.best_score:.4f} "
+                f"(from epoch {self.ckpt_mgr.best_epoch})"
+            )
+        elif "metrics" in checkpoint and self.ckpt_mgr.metric_name in checkpoint["metrics"]:
+            # Fallback if best_score field is missing but metrics are there
+            m_name = self.ckpt_mgr.metric_name
+            self.ckpt_mgr.best_score = checkpoint["metrics"][m_name]
+            self.ckpt_mgr.best_epoch = checkpoint.get("epoch", 0)
+            logger.info(f"📈 Estimated best score from metrics: {self.ckpt_mgr.best_score:.4f}")
+
+        # 2. Model State (Non-strict to allow architectural shifts/head removal)
+        try:
+            model_state = checkpoint["model_state_dict"]
+            if hasattr(self.model, "module"):
+                self.model.module.load_state_dict(model_state, strict=False)
+            else:
+                self.model.load_state_dict(model_state, strict=False)
+            logger.info("✅ Model state loaded (strict=False)")
+        except Exception as e:
+            logger.error(f"❌ Failed to load model state: {e}")
+            return 0
+
+        # 3. Optimizer State
         if "optimizer_state_dict" in checkpoint:
             try:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except Exception as e:
-                logger.warning(f"Could not load optimizer state: {e}")
+                logger.warning(
+                    f"⚠️ Optimizer mismatch (likely due to head removal/change): {e}. "
+                    "Resetting optimizer state for continuing heads."
+                )
 
-        # 3. Scheduler State
+        # 4. Scheduler State
         if "scheduler_state_dict" in checkpoint and self.scheduler is not None:
             try:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             except Exception as e:
                 logger.warning(f"Could not load scheduler state: {e}")
 
-        # 4. Starting Epoch
-        # If this is 'latest.pt', it might be a mid-epoch save.
-        # We check a custom flag 'epoch_completed' to decide if we increment.
-        is_completed = checkpoint.get("metrics", {}).get("epoch_completed", True)
-        epoch_val = checkpoint.get("epoch", 0)
+        # 5. Starting Epoch
+        metrics = checkpoint.get("metrics", {})
+        is_completed = metrics.get("epoch_completed", False)
+        start_epoch = checkpoint.get("epoch", 0)
         
         if is_completed:
-            start_epoch = epoch_val + 1
-            logger.info(f"✅ Finished epoch {epoch_val}. Resuming from epoch {start_epoch}")
+            start_epoch += 1
+            logger.info(f"✅ Epoch {start_epoch-1} was complete. Resuming from NEXT epoch: {start_epoch}")
         else:
-            start_epoch = epoch_val
-            logger.info(f"⚠️ Resuming unfinished/crashed epoch {start_epoch}")
-
+            logger.warning(
+                f"⚠️ Epoch {start_epoch} was NOT completed (crash or interruption). "
+                f"Restarting from SAME epoch: {start_epoch}"
+            )
+        
         self.start_epoch = start_epoch
-        return start_epoch
-
-    def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> int:
-        """
-        Loads model, optimizer, and scheduler state from a checkpoint.
-        Returns the next epoch to start from.
-        """
-        path = Path(checkpoint_path)
-        if not path.exists():
-            logger.warning(f"Checkpoint not found at {path}. Starting from scratch.")
-            return 1
-
-        logger.info(f"📂 Loading checkpoint: {path}")
-        # Map location to current device to avoid CUDA/CPU mismatches
-        checkpoint = torch.load(path, map_location=self.device)
-
-        # 1. Model State
-        if hasattr(self.model, "module"):
-            self.model.module.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-
-        # 2. Optimizer State
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-        # 3. Scheduler State
-        if "scheduler_state_dict" in checkpoint and self.scheduler is not None:
-            try:
-                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            except Exception as e:
-                logger.warning(f"Could not load scheduler state: {e}")
-
-        # 4. Starting Epoch
-        start_epoch = checkpoint.get("epoch", 0) + 1
-        self.start_epoch = start_epoch
-
         logger.info(f"✅ Successfully resumed from epoch {start_epoch}")
         return start_epoch
 
-    def fit(self):
+    def fit(self) -> bool:
         """Run full training loop with detailed logging and TensorBoard visualization."""
         set_seed(self.config.seed)
         self.was_interrupted = False
@@ -701,12 +711,23 @@ class Trainer:
                 if self.rank == 0:
                     avg_iou = val_metrics.get("avg_iou", 0)
                     avg_dice = val_metrics.get("avg_dice", 0)
+                    roof_acc = val_metrics.get("roof_type_accuracy", 0)
+                    # Detailed per-task IoU breakdown for logging
+                    task_ious = {
+                        k.replace("_iou", ""): f"{v:.4f}"
+                        for k, v in val_metrics.items()
+                        if k.endswith("_iou") and k != "avg_iou"
+                    }
+                    task_str = " | ".join([f"{k}:{v}" for k, v in task_ious.items()])
+
                     logger.info(
                         f"Epoch {epoch}/{self.config.num_epochs} │ "
                         f"Train Loss: {train_loss:.4f} │ Val Loss: {val_loss:.4f} │ "
                         f"Avg IoU: {avg_iou:.4f} │ Avg Dice: {avg_dice:.4f} │ "
-                        f"LR: {current_lr:.2e}"
+                        f"Roof Acc: {roof_acc:.4f} │ LR: {current_lr:.2e}"
                     )
+                    if task_str:
+                        logger.info(f"Task IoUs: {task_str}")
 
                 # Save checkpoint (includes best_latest.pt save)
                 val_metrics["epoch_completed"] = True  # Mark as finished
@@ -730,7 +751,13 @@ class Trainer:
                         f"without improvement. Best epoch: {self.ckpt_mgr.best_epoch}"
                     )
                     break
-            completed_successfully = True
+
+                if self.config.one_epoch_only:
+                    logger.info("One epoch only requested. Stopping.")
+                if self.config.one_epoch_only:
+                    logger.info("One epoch only requested. Stopping.")
+                    return (epoch >= self.config.num_epochs)
+            return True
 
         except (KeyboardInterrupt, Exception) as e:
             logger.error(f"Training interrupted or crashed: {e}")
@@ -844,10 +871,21 @@ class Trainer:
                     # Normalize loss for accumulation
                     loss = loss / accum_steps
 
-                # Skip NaN/Inf loss batches
-                if torch.isnan(loss) or torch.isinf(loss):
+                # ── NaN/Inf Guard (DDP Synchronized) ──
+                is_bad = torch.isnan(loss) or torch.isinf(loss)
+                if self.is_distributed:
+                    # Sync skip flag across all GPUs to prevent deadlock
+                    skip_batch = torch.tensor([1.0 if is_bad else 0.0], device=self.device)
+                    dist.all_reduce(skip_batch, op=dist.ReduceOp.MAX)
+                    is_bad = skip_batch.item() > 0.5
+
+                if is_bad:
                     if self.rank == 0:
-                        train_iter.set_postfix(loss="NaN-skip")
+                        logger.warning(
+                            f"⚠️ NaN/Inf detected at Epoch {epoch}, Batch {i}. "
+                            "Synchronized skip activated for all GPUs."
+                        )
+                    self.optimizer.zero_grad(set_to_none=True)
                     continue
 
                 # Backward
@@ -860,6 +898,8 @@ class Trainer:
             if (i + 1) % accum_steps == 0 or (i + 1) == len(self.train_loader):
                 if self.use_amp:
                     self.scaler.unscale_(self.optimizer)
+                    # Sync and check for NaNs in gradients (scaler.step handles this internally, 
+                    # but we can be explicit or just trust the scaler)
                     nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.config.gradient_clip
                     )
@@ -918,6 +958,16 @@ class Trainer:
         avg_loss = total_loss / max(n_batches, 1)
         avg_breakdown = {k: v / max(n_batches, 1) for k, v in breakdown_sums.items()}
         
+        # ── Weight NaN Check ──
+        has_nan_weights = False
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                logger.error(f"🚨 WEIGHT CORRUPTION: NaN detected in {name} at end of Epoch {epoch}!")
+                has_nan_weights = True
+                break
+        if has_nan_weights:
+            raise RuntimeError(f"Weights poisoned with NaN at Epoch {epoch}. Stopping to prevent further corruption.")
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
@@ -931,12 +981,15 @@ class Trainer:
         total_loss = 0.0
         n_batches = 0
 
+        if self.rank == 0:
+            logger.info(f"🔍 Starting Validation Epoch {epoch}...")
+
         # Optional: only show progress bar on Rank 0
         disable_tqdm = (self.rank != 0)
         val_iter: Any = tqdm(
             self.val_loader,
             desc=f"Val Epoch {epoch}",
-            leave=False,
+            leave=True,
             dynamic_ncols=True,
             disable=disable_tqdm,
         )

@@ -30,7 +30,7 @@ graph TD
 
     subgraph "Specialized Task Heads"
         H --> I["BuildingHead (Dual: Footprint + Roof Class)"]
-        H --> J["Road/Rail Head (D-LinkNet Dilated)"]
+        H --> J["Road Head (D-LinkNet Dilated)"]
         H --> K["Water/Utility Head (Binary + Detection)"]
         H --> L["YOLOv8 Point Fusion (Wells/Transformers)"]
     end

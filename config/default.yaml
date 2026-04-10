@@ -46,11 +46,7 @@ loss_weights:
   road_centerline: 1.2
   waterbody: 1.2
   waterbody_line: 1.2
-  waterbody_point: 1.5
   utility_line: 1.2
-  utility_point: 1.3
-  bridge: 1.5
-  railway: 1.3
 
 # Checkpointing
 checkpoint:

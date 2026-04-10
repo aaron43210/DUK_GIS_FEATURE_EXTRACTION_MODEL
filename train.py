@@ -180,31 +180,12 @@ def main():
             "--name",
             "segmentation_v1",
         ]
-<<<<<<< HEAD
         if args.resume:
             seg_cmd.append("--resume")
-            
-    # Step 2 & 3: Parallel Training
-    # Define Commands
-    # 1. Segmentation
-    # (seg_cmd is already defined above in line 165 or 168)
-    
-    # 2. YOLO
-    yolo_cmd = [
-=======
-        + args.train_dirs
-        + ["--checkpoint_dir", "checkpoints", "--name", "ensemble_v3_final"]
-    )
-    if args.resume:
-        seg_cmd.append("--resume")
 
-    run_step(seg_cmd, "Segmentation Training")
-
-    # Step 3: Train YOLO Point Detection Model
+    # Step 3: Define YOLO Point Detection Command (will be run in parallel)
     # This handles Transformers, Wells, and Overhead Tanks
-    logger.info("\n[STAGE 3/3] Training YOLO Point Detector...")
     yolo_train_cmd = [
->>>>>>> 48371e9 (Final production push: SegFormer-B4 architecture, memory optimizations, and robust resume mechanism)
         sys.executable,
         str(project_root / "scripts" / "train_yolo.py"),
         "--data",
@@ -233,7 +214,7 @@ def main():
 
     # Launch YOLO (Background)
     logger.info("🚀 Launching Stage 3: YOLO Point Detection Training (Background)")
-    p_yolo = subprocess.Popen(yolo_cmd)
+    p_yolo = subprocess.Popen(yolo_train_cmd)
     processes.append((p_yolo, "YOLO"))
 
     logger.info("\n" + "="*60)

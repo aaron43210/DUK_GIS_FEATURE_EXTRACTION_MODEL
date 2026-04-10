@@ -248,25 +248,17 @@ DEFAULT_WEIGHTS = {
     "road": 1.0,
     "road_centerline": 0.8,
     "waterbody": 1.0,
-    "waterbody_line": 0.8,
-    "waterbody_point": 1.2,
+    "waterbody_line": 1.0,
     "utility_line": 1.0,
-    "utility_point": 1.2,
-    "bridge": 1.0,
-    "railway": 1.0,
+    "utility_poly": 1.0,
 }
 
 BINARY_TASKS = [
     "building",
     "road",
     "road_centerline",
-    "waterbody",
-    "waterbody_line",
-    "waterbody_point",
-    "utility_line",
-    "utility_point",
-    "bridge",
-    "railway",
+    "waterbody", "waterbody_line", "utility_line", "utility_poly"
+,
 ]
 
 
@@ -296,7 +288,7 @@ class MultiTaskLoss(nn.Module):
         self.lovasz = LovaszHingeLoss()
 
         # Multi-class loss for roof types
-        self.ce = nn.CrossEntropyLoss(ignore_index=0)  # ignore background
+        self.ce = nn.CrossEntropyLoss(ignore_index=0, reduction="sum")  # ignore background
         self.mc_dice = MultiClassDiceLoss(num_roof_classes)
 
         self.boundary = BoundaryLoss()
@@ -354,7 +346,7 @@ class MultiTaskLoss(nn.Module):
 
         # Weights tuned for >95% IoU (emphasizing IoU/Lovasz and Tversky/Boundary)
         return (
-            0.6 * bce + 1.0 * dice + 0.8 * tversky + 0.3 * focal + 1.2 * lovasz + 0.5 * bdry
+            0.6 * bce + 0.9 * dice + 0.7 * tversky + 0.3 * focal + 1.0 * lovasz + 0.5 * bdry
         )
 
     def forward(
@@ -377,8 +369,10 @@ class MultiTaskLoss(nn.Module):
                 predictions[pred_key], targets[pred_key], mask=valid_mask
             )
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
+            # ── NaN Check per Task ──
+            if torch.isnan(loss):
+                print(f"🚨 TASK NaN: '{task}' produced NaN loss!")
+            
             weighted = loss * self.weights.get(task, 1.0)
             total = total + weighted
             breakdown[task] = loss.item()
@@ -389,17 +383,30 @@ class MultiTaskLoss(nn.Module):
             rt_target = targets["roof_type_mask"]
             if rt_target.ndim == 4:
                 rt_target = rt_target.squeeze(1)
-            # Skip if all pixels are background (class 0)
-            # CE with ignore_index=0 returns NaN when
-            # there are no non-ignored pixels
-            if (rt_target.long() != 0).any():
-                rt_loss = self.ce(rt_pred, rt_target.long()) + self.mc_dice(
-                    rt_pred, rt_target
-                )
-                if not (torch.isnan(rt_loss) or torch.isinf(rt_loss)):
-                    w = self.weights.get("roof_type", 0.5)
-                    total = total + rt_loss * w
-                    breakdown["roof_type"] = rt_loss.item()
+            
+            # ── REDUNDANT SAFETY GUARD ───────────────────────────────────────
+            # Clamp targets to [0, n_classes-1] to prevent CUDA NLLLoss asserts
+            # This handles cases where shapefiles contain unexpected class IDs.
+            num_classes = rt_pred.size(1)
+            rt_target = rt_target.long().clamp(0, num_classes - 1)
+            # ─────────────────────────────────────────────────────────────────
+                
+            # Compute CE with reduction="sum" and divide by valid pixels manually.
+            # This is mathematically identical to reduction="mean", but when there
+            # are NO valid targets (all background), it safely evaluates to EXACTLY 0.0
+            # instead of NaN. This guarantees the model parameters (roof_out) are
+            # naturally included in the compute graph avoiding DDP reduction crashes!
+            valid_pixels = (rt_target != 0).sum()
+            ce_loss = self.ce(rt_pred, rt_target) / torch.clamp(valid_pixels, min=1)
+            rt_loss = ce_loss + self.mc_dice(rt_pred, rt_target)
+
+            if torch.isnan(rt_loss):
+                print("🚨 TASK NaN: 'roof_type' produced NaN loss!")
+
+            # DDP CRITICAL: Same rule, we MUST NOT hide NaNs!
+            w = self.weights.get("roof_type", 0.5)
+            total = total + rt_loss * w
+            breakdown["roof_type"] = rt_loss.item()
 
         # Normalize loss by number of active tasks
         n_active = len(breakdown)

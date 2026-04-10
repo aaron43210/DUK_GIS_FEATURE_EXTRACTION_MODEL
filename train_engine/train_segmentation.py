@@ -53,15 +53,10 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--tile_size", type=int, default=512)
     p.add_argument("--tile_overlap", type=int, default=96)
-<<<<<<< HEAD
-    p.add_argument(
-        "--num_workers", type=int, default=4
-    )  # Halved to prevent OOM / CPU lock
-=======
     p.add_argument("--num_workers", type=int, default=4)  # Halved to prevent OOM / CPU lock
->>>>>>> 48371e9 (Final production push: SegFormer-B4 architecture, memory optimizations, and robust resume mechanism)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--freeze_epochs", type=int, default=5)
+    p.add_argument("--one_epoch_only", action="store_true", help="Stop after 1 epoch")
     p.add_argument(
         "--model_name",
         default=DEFAULT_SEGFORMER_MODEL,
@@ -70,19 +65,9 @@ def parse_args():
 
     # DGX Specifics
     p.add_argument("--checkpoint_dir", default="check", help="Requested 'check' dir")
-<<<<<<< HEAD
-    p.add_argument("--name", default="dgx_ensemble_v1", help="Experiment name")
-    p.add_argument(
-        "--resume", action="store_true", help="Resume from latest.pt if found"
-    )
-    p.add_argument(
-        "--checkpoint", default=None, help="Specific .pt file to resume from"
-    )
-=======
     p.add_argument("--name", default="dgx_ensemble_v3", help="Experiment name")
     p.add_argument("--resume", action="store_true", help="Resume from latest.pt if found")
     p.add_argument("--checkpoint", default=None, help="Specific .pt file to resume from")
->>>>>>> 48371e9 (Final production push: SegFormer-B4 architecture, memory optimizations, and robust resume mechanism)
     p.add_argument(
         "--multi_gpu",
         action="store_true",
@@ -134,7 +119,8 @@ def main():
             dropout=args.dropout,
             sam2_checkpoint=None,
             mixed_precision=True,
-            force_cpu=not torch.cuda.is_available(),
+            force_cpu=False,
+            one_epoch_only=args.one_epoch_only,
             cache_features=False,
         )
         # Handle multi_gpu flag override if requested
@@ -153,11 +139,10 @@ def main():
 
         # Set device early to prevent NCCL mapping ambiguity
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(local_rank)
 
         dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
+            backend="nccl",
             timeout=timedelta(minutes=5),
         )
 
@@ -189,7 +174,6 @@ def main():
     # Train
     trainer = Trainer(model, train_loader, val_loader, loss_fn, config)
 
-<<<<<<< HEAD
     # Resume Logic (Refined for Robustness)
     if args.resume or args.checkpoint:
         success = False
@@ -202,13 +186,15 @@ def main():
                 potential = Path(args.checkpoint_dir) / name
                 if potential.exists():
                     logger.info(f"🔍 Auto-detected checkpoint for resume: {name}")
-                    res = trainer.load_checkpoint(str(potential))
-                    if res > 0:
-                        success = True
-                        break
-                    else:
+                    try:
+                        res = trainer.load_checkpoint(str(potential))
+                        if res > 0:
+                            success = True
+                            break
+                    except Exception as e:
                         logger.warning(
-                            f"⚠️ Corrupted checkpoint detected: {name}. Trying fallback..."
+                            f"⚠️ Corrupted or incompatible checkpoint detected ({name}): {e}. "
+                            "Trying fallback..."
                         )
 
         if not success:
@@ -219,26 +205,21 @@ def main():
             else:
                 logger.warning(f"No usable checkpoints found in {args.checkpoint_dir}")
             logger.info("🚀 Starting training from scratch (Epoch 1)...")
-=======
-    # Resume Logic
-    if args.resume or args.checkpoint:
-        ckpt_path = args.checkpoint
-        if not ckpt_path:
-            # Look for latest.pt in the checkpoint directory
-            potential_latest = Path(args.checkpoint_dir) / "latest.pt"
-            if potential_latest.exists():
-                ckpt_path = str(potential_latest)
-            else:
-                logger.warning(f"No latest.pt found in {args.checkpoint_dir}")
-
-        if ckpt_path:
-            trainer.load_checkpoint(ckpt_path)
->>>>>>> 48371e9 (Final production push: SegFormer-B4 architecture, memory optimizations, and robust resume mechanism)
 
     logger.info("Starting training on optimized GPU...")
-    trainer.fit()
-
-    logger.info(f"🎉 Training finished. Checkpoints in: {args.checkpoint_dir}")
+    
+    try:
+        is_finished = trainer.fit()
+        if is_finished:
+            logger.info(f"🎉 Training finished. Checkpoints in: {args.checkpoint_dir}")
+            sys.exit(0)
+        else:
+            logger.info("⏳ Epoch completed (one_epoch_only). Signaling continuation...")
+            sys.exit(3)
+    except Exception as e:
+        logger.critical(f"💥 Training script failed with critical error: {e}")
+        # If it crashed, we don't want to signal exit code 3 (continue)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

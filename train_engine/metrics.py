@@ -106,7 +106,7 @@ class TaskMetrics:
         }
 
     def get_stats_tensor(self, device: str = None) -> torch.Tensor:
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        device = device or "cuda"
         return torch.tensor(
             [self.tp, self.fp, self.fn, self.tn],
             dtype=torch.float64,
@@ -122,7 +122,7 @@ class TaskMetrics:
         """Deprecated: Use MetricsTracker.sync() for batch synchronization."""
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
-        data = self.get_stats_tensor(device="cuda" if torch.cuda.is_available() else "cpu")
+        data = self.get_stats_tensor(device="cuda")
         torch.distributed.all_reduce(data, op=torch.distributed.ReduceOp.SUM)
         self.set_stats_from_tensor(data)
 
@@ -177,7 +177,7 @@ class RoofTypeMetrics:
             result[f"roof_{classes[c]}_acc"] = float(acc)
         return result
 
-    def get_stats_tensor(self, device: str = "cpu") -> torch.Tensor:
+    def get_stats_tensor(self, device: str = "cuda") -> torch.Tensor:
         """Returns stats as a tensor for consolidated sync."""
         # Stats: [correct, total, per_class_correct..., per_class_total...]
         stats: List[float] = [float(self.correct), float(self.total)]
@@ -199,8 +199,7 @@ class RoofTypeMetrics:
         """Deprecated: Use MetricsTracker.sync() for batch synchronization."""
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        data = self.get_stats_tensor(device=device)
+        data = self.get_stats_tensor(device="cuda")
         torch.distributed.all_reduce(data, op=torch.distributed.ReduceOp.SUM)
         self.set_stats_from_tensor(data)
 
@@ -214,11 +213,7 @@ class MetricsTracker:
         "road_centerline",
         "waterbody",
         "waterbody_line",
-        "waterbody_point",
         "utility_line",
-        "utility_point",
-        "bridge",
-        "railway",
     ]
 
     def __init__(self, threshold: float = 0.5, num_roof_classes: int = 5):
@@ -280,13 +275,11 @@ class MetricsTracker:
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
         # 1. Collect all tensors
         tensors = []
         for task in self.BINARY_TASKS:
-            tensors.append(self.binary_metrics[task].get_stats_tensor(device))
-        tensors.append(self.roof_metrics.get_stats_tensor(device))
+            tensors.append(self.binary_metrics[task].get_stats_tensor("cuda"))
+        tensors.append(self.roof_metrics.get_stats_tensor("cuda"))
         
         # 2. Concatenate into one large vector
         combined = torch.cat(tensors)

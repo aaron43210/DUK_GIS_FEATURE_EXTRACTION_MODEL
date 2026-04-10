@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 # Matches the YOLO_CLASS_TO_MASK in inference/predict.py
 #   0 → well  (waterbody_point)
 #   1 → transformer (utility_point)
-#   1 → transformer (utility_point)
 
 UTILITY_CLASS_MAP: Dict[str, int] = {
     "transformer": 1,

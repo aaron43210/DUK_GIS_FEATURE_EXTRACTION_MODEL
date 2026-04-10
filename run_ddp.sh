@@ -2,11 +2,14 @@
 # 🚀 DUK-EM 8-GPU DDP Training Launch Script
 # Scaled for DGX Systems (8x A100/H100)
 
-# 1. High-Performance Configuration
-export OMP_NUM_THREADS=1                 # Prevent CPU contention
+# 1. High-Performance Configuration (Industrial Audit Grade)
+export OMP_NUM_THREADS=1                 # Prevent CPU contention (1 thread per DDP process)
+export MKL_NUM_THREADS=1                 # Consistent with OMP
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 # DDP Robustness
-export CUDA_LAUNCH_BLOCKING=0            # Async kernel launches
+export CUDA_LAUNCH_BLOCKING=0            # Async kernel launches for speed
 export NCCL_TIMEOUT=1800000              # Increase timeout to 30 mins
+export NCCL_P2P_DISABLE=0                # CRITICAL: Force NVLink P2P (don't disable)
+export NCCL_IB_DISABLE=0                 # CRITICAL: Force InfiniBand use on DGX
 export TORCH_DISTRIBUTED_DEBUG=DETAIL    # Better crash logs
 export MASTER_PORT=$((29500 + RANDOM % 100)) # Avoid 'Address already in use' errors
 
@@ -18,7 +21,7 @@ else
 fi
 EPOCHS=150
 PER_GPU_BATCH=12         # Optimized from 16 to 12 to prevent OOM on SegFormer-B4
-WORKERS=8                # Maintain 8 workers for high-speed data feeding
+WORKERS=1                # 1 worker per GPU — minimal CPU usage, still prefetches 1 batch ahead
 
 echo "=========================================================="
 echo "🌟 LAUNCHING 8-GPU DDP TRAINING"
@@ -33,11 +36,9 @@ while true; do
     echo "=========================================================="
     echo "🔍 SCANNING FOR AVAILABLE GPUs..."
     
-    # Extract IDs of GPUs with >20,000 MiB free memory
-    # Exclude GPU 4 (Reserved for YOLO)
-    RESERVED_YOLO_GPU=4
+    # Extract IDs of all GPUs with >20,000 MiB free memory
     FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | \
-        awk -F', ' -v reserved="$RESERVED_YOLO_GPU" '$2 > 20000 && $1 != reserved {print $1}' | \
+        awk -F', ' '$2 > 20000 {print $1}' | \
         paste -sd "," -)
 
     if [ -z "$FREE_GPUS" ]; then
@@ -83,6 +84,10 @@ while true; do
     if [ $EXIT_CODE -eq 0 ]; then
         echo "🎉 Segmentation Training completed successfully!"
         break # Exit loop on success
+    elif [ $EXIT_CODE -eq 3 ]; then
+        echo "⏳ Epoch completed (one_epoch_only). Re-scanning and restarting for next epoch..."
+        sleep 5
+        continue # Continue to next epoch restart
     else
         echo "⚠️ Training crashed (Exit Code: $EXIT_CODE)! Likely OOM or Preemption."
         echo "⏳ Waiting 30s for memory to clear before releasing and restarting..."

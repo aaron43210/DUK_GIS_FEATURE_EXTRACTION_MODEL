@@ -1,4 +1,4 @@
-# 🛰️ DIGITAL UNIVERSITY OF KERALA EXTRACTION MODEL (V1)
+# 🎓 DIGITAL UNIVERSITY KERALA FEATURE EXTRACTION MODEL (DUK-FEM)
 
 > **High-resolution geospatial feature extraction from drone orthophotos.** 
 > This pipeline achieves ≥95% accuracy by leveraging a specialized ensemble of State-of-the-Art (SOTA) deep learning models.
@@ -19,7 +19,6 @@ This repository is scoped to **Problem Statement 1** only:
 ## 🚀 Key Features
 - **Unified SOTA Architecture**: Transitioned to a multi-scale **SegFormer-B4** backbone with an **UPerFPN** decoder for industry-leading perceptual accuracy.
 - **Specialized Task Heads**: Integrated multi-head system:
-  - **LineHead with DLinkBlock**: Native connectivity maintenance for road/railway networks.
   - **BuildingHead**: Dual-output for high-precision segmentation and roof classification.
   - **BinaryHead/LineHead**: Optimized for waterbodies and utility lines.
 - **Full State Resumption**: Robust training pipeline with 100% recovery of optimizer and scheduler states.
@@ -36,7 +35,7 @@ This repository is scoped to **Problem Statement 1** only:
 | **Backbone** | SegFormer-B4 (Mix ViT) | Multi-scale Feature Extraction & Transformers |
 | **Decoder** | UPerFPN + CBAM Attention | Context-Aware Global Fusion |
 | **Buildings**| Dual-Output Head | Instance Mask + Roof Classification |
-| **Roads/Rail**| D-LinkNet Head | Network Connectivity & Smoothing |
+| **Roads** | D-LinkNet Head | Network Connectivity & Smoothing |
 | **Utilities** | U-Net++ Multi-Head | Linear & Point Feature Precision |
 | **Points** | YOLOv8 + Fusion | Wells, Transformers, Tanks |
 
@@ -49,7 +48,6 @@ For best practical accuracy and stability on drone imagery, we utilize a hybrid 
    - **DeepLabV3+**: Building and water polygons.
    - **D-LinkNet**: Roads and centerlines.
    - **U-Net++**: Utility linear features.
-   - **HRNet**: Railway continuity.
    - **YOLOv8**: Sparse point objects (wells, transformers, tanks).
 3. **Classification**: Dedicated head for RCC/Tiled/Tin/Others roof types.
 
@@ -126,8 +124,6 @@ data/
 | `waterbody_point_mask` | Wells | Point |
 | `utility_line_mask` | Utility (Pipeline/Wires) | Line |
 | `utility_point_mask`| Utility Point | Point |
-| `bridge_mask` | Bridge | Polygon |
-| `railway_mask`| Railway | Line |
 
 ---
 
@@ -138,4 +134,4 @@ data/
 
 ---
 
-**Developed with ❤️ by Digital University Kerala Students**
+**Developed with ❤️ by Digital University Kerala**

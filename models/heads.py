@@ -246,16 +246,15 @@ def create_all_heads(
     # Polygon heads
     heads["road"] = BinaryHead(in_channels, 64, dropout)
     heads["waterbody"] = BinaryHead(in_channels, 64, dropout)
-    heads["bridge"] = BinaryHead(in_channels, 64, dropout)
 
     # Line heads
     heads["road_centerline"] = LineHead(in_channels, 64, dropout)
     heads["waterbody_line"] = LineHead(in_channels, 64, dropout)
     heads["utility_line"] = LineHead(in_channels, 64, dropout)
-    heads["railway"] = LineHead(in_channels, 64, dropout)
+    heads["utility_poly"] = BinaryHead(in_channels, 64, dropout)
 
-    # Point/Small Object heads (using DetectionHead for better IoU)
-    heads["waterbody_point"] = DetectionHead(in_channels, 64, dropout)
-    heads["utility_point"] = DetectionHead(in_channels, 64, dropout)
+    # Point/Small Object heads (removed to let YOLO handle them exclusively)
+    # heads["waterbody_point"] = DetectionHead(in_channels, 64, dropout)
+    # heads["utility_point"] = DetectionHead(in_channels, 64, dropout)
 
     return heads

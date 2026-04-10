@@ -31,7 +31,7 @@ class TrainingConfig:
     # ── Training ─────────────────────────────────────────────────────────────
     batch_size: int = 8
     num_epochs: int = 100
-    learning_rate: float = 3e-4
+    learning_rate: float = 1.5e-4
     weight_decay: float = 1e-4
     optimizer: str = "adamw"  # adamw | sgd
     scheduler: str = "cosine"  # cosine | step | plateau
@@ -43,6 +43,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 1
     seed: int = 42
     force_cpu: bool = False
+    one_epoch_only: bool = False
 
     # ── Feature Caching ──
     cache_features: bool = False
@@ -58,17 +59,13 @@ class TrainingConfig:
     # ── Loss Weights ─────────────────────────────────────────────────────────
     loss_weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "building": 1.0,
-            "road": 1.0,
-            "road_centerline": 1.1,
+            "building": 1.2,
+            "road": 1.1,
+            "road_centerline": 0.5,
             "waterbody": 1.0,
-            "waterbody_line": 1.0,
-            "waterbody_point": 1.2,
-            "utility_line": 1.0,
-            "utility_point": 1.2,
-            "bridge": 1.1,
-            "railway": 1.0,
-            "roof_type": 0.5,
+            "waterbody_line": 0.5,
+            "utility_line": 0.4,
+            "roof_type": 0.7,
         }
     )
 

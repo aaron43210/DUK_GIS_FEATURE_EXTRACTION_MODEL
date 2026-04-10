@@ -1,11 +1,12 @@
 """
-SVAMITVA Feature Extraction — Production Ensemble V3 Web Application
+DIGITAL UNIVERSITY KERALA FEATURE EXTRACTION MODEL (DUK-FEM)
 """
 
 import atexit
 import io
 import os
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from inference.postprocess import refine_mask, get_threshold
 # ── Page Config ─────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="SVAMITVA Ensemble AI",
+    page_title="DUK-FEM Ensemble AI",
     page_icon="🛰️",
     layout="wide",
 )
@@ -79,15 +80,15 @@ FEATURES = {
     "road_mask": ("Road (Polygon)", (255, 255, 100)),
     "road_centerline_mask": ("Road Centre Line (LineString)", (255, 220, 0)),
     "waterbody_mask": ("Water Body (Polygon)", (50, 150, 255)),
-    "waterbody_line_mask": ("Water Body Line (LineString)", (0, 210, 255)),
     "waterbody_point_mask": ("Well", (0, 255, 255)),
     "utility_line_mask": ("Utility - Pipeline/Wires (LineString)", (50, 220, 100)),
+    "utility_point_mask": ("Utility - Generic Point", (0, 200, 255)),
     "utility_transformer_mask": ("Transformer", (0, 255, 120)),
-    "bridge_mask": ("Bridge (Polygon)", (255, 140, 0)),
-    "railway_mask": ("Railway (LineString)", (180, 80, 255)),
 }
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA GPU is required. CPU/MPS execution is not permitted.")
+DEVICE = torch.device("cuda")
 
 
 # Helper for robust weight selection
@@ -96,9 +97,10 @@ def get_best_ckpt():
         "check/best.pt",
         "check/best_latest.pt",
         "checkpoints/best.pt",
-        "checkpoints/ensemble_v3.pt",
-        "best_latest.pt",
         "best.pt",
+        "best_latest.pt",
+        "latest.pt",
+        "checkpoints/ensemble_v3.pt",
     ]
     for c in candidates:
         if Path(c).exists():
@@ -130,7 +132,7 @@ ALLOWED_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 
 
 def main():
-    st.title("🛰️ SVAMITVA Production Ensemble V3")
+    st.title("🎓 DUK Feature Extraction Model (V3)")
 
     with st.sidebar:
         st.header("⚙️ Model Config")
@@ -138,10 +140,9 @@ def main():
 
         # Try to find the local YOLO model first
         paths_to_check = [
-            "check/yolo_best.pt",
-            "check/yolo_svamitva_best.pt",
-            os.path.expanduser("~/yolo_svamitva_best.pt"),
-            os.path.expanduser("~/Downloads/yolo_svamitva_best.pt"),
+            "weights/yolov8s.pt",
+            "yolo_best.pt",
+            "weights/yolo_best.pt",
             "checkpoints/yolov8s.pt",
         ]
 
@@ -160,6 +161,29 @@ def main():
             enabled = st.checkbox(meta[0], value=True, key=f"feature_{key}")
             if enabled:
                 selected_masks.append(key)
+
+        st.divider()
+        st.subheader("📍 Legend")
+        for key, (name, color) in FEATURES.items():
+            # Use raw HTML for color boxes
+            st.markdown(
+                f'<div style="display: flex; align-items: center; margin-bottom: 4px;">'
+                f'<div style="width: 16px; height: 16px; background-color: rgb{color}; border-radius: 3px; margin-right: 8px; border: 1px solid rgba(255,255,255,0.2);"></div>'
+                f'<span style="font-size: 0.85rem; color: #b0b0b8;">{name}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            # Add sub-legend for roofs
+            if key == "roof_type_mask":
+                st.markdown(
+                    '<div style="margin-left: 24px; font-size: 0.75rem; border-left: 1px solid rgba(255,255,255,0.1); padding-left: 8px;">'
+                    '• <span style="color:#ff7f0e">RCC</span> | '
+                    '• <span style="color:#2ca02c">Tiled</span> | '
+                    '• <span style="color:#d62728">Tin</span> | '
+                    '• <span style="color:#9467bd">Others</span>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
 
         st.divider()
         st.subheader("🎛️ Parameters")
@@ -223,10 +247,25 @@ def main():
                     st.warning("⚠️ Please select at least one feature to extract!")
                     st.stop()
 
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                start_time = time.time()
+                status_text.info("🧬 Initializing DUK-FEM Ensemble Weights...")
+
+                def progress_callback(current, total):
+                    pct = (current + 1) / total
+                    progress_bar.progress(pct)
+                    
+                    elapsed = time.time() - start_time
+                    if pct > 0:
+                        total_est = elapsed / pct
+                        remaining = total_est - elapsed
+                        mins, secs = divmod(int(remaining), 60)
+                        status_text.markdown(
+                            f"**Progress**: {pct:.1%} | **Estimated Time Remaining**: {mins}m {secs}s"
+                        )
+
                 with st.spinner("Analyzing Image..."):
-                    st.info(
-                        "🧬 Applying Training-Matched Normalization (Percentile + ImageNet)"
-                    )
                     predictor = load_ensemble_pipeline(
                         weights_path=ckpt_path,
                         yolo_path=yolo_path,
@@ -243,16 +282,20 @@ def main():
                         st.session_state.results = predictor.predict_tif(
                             tif_path,
                             selected_masks=selected_masks,
+                            progress_callback=progress_callback,
                         )
                     else:
                         st.session_state.results = predictor.predict_image(
                             tif_path,
                             selected_masks=selected_masks,
                         )
+                
+                progress_bar.empty()
+                status_text.empty()
 
-                    st.session_state.tif_path = tif_path
-                    st.session_state.is_geospatial = is_geospatial
-                    st.success("Analysis Complete!")
+                st.session_state.tif_path = tif_path
+                st.session_state.is_geospatial = is_geospatial
+                st.success("Analysis Complete!")
 
         results = st.session_state.get("results")
         if results:
@@ -318,7 +361,7 @@ def main():
                     thumb = np.clip(t / vmax, 0.0, 1.0) * 255.0
                 thumb = thumb.astype(np.uint8)
 
-            tab_global, tab_detail = st.tabs(["🌍 Global Overview", "🔍 Detail View"])
+            tab_global, tab_detail, tab_compare = st.tabs(["🌍 Global Overview", "🔍 Detail View", "↔️ Comparison"])
 
             with tab_global:
                 st.subheader("Ensemble Overview")
@@ -358,6 +401,18 @@ def main():
                         mask_key = det.get("mask_key")
                         if mask_key in FEATURES:
                             color = FEATURES[mask_key][1][::-1]  # RGB -> BGR for cv2
+                            # Draw Bounding Box (Rectangle)
+                            cv2.rectangle(overlay, (int(x1*scale_x), int(y1*scale_y)), 
+                                          (int(x2*scale_x), int(y2*scale_y)), color, 2)
+                            # Draw a background for the label
+                            label = det.get("label", "Feature")
+                            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                            cv2.rectangle(overlay, (int(x1*scale_x), int(y1*scale_y)-lh-10), 
+                                          (int(x1*scale_x)+lw+10, int(y1*scale_y)), color, -1)
+                            cv2.putText(overlay, label, 
+                                        (int(x1*scale_x)+5, int(y1*scale_y)-7), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+                            
                             # Draw a circle + crosshair
                             cv2.circle(overlay, (cx, cy), 12, (255, 255, 255), 2)
                             cv2.circle(overlay, (cx, cy), 10, color, -1)
@@ -442,6 +497,9 @@ def main():
                                     x1, y1, x2, y2 = det["box"]
                                     cx = int((x1 + x2) / 2 * scale_x)
                                     cy = int((y1 + y2) / 2 * scale_y)
+                                    # Draw Bounding Box (Rectangle)
+                                    cv2.rectangle(c_mask, (int(x1*scale_x), int(y1*scale_y)), 
+                                                  (int(x2*scale_x), int(y2*scale_y)), f_color[::-1], 2)
                                     cv2.circle(c_mask, (cx, cy), 15, (255, 255, 255), 2)
                                     cv2.circle(c_mask, (cx, cy), 12, f_color[::-1], -1)
 
@@ -478,6 +536,9 @@ def main():
                             cx = int((x1 + x2) / 2 * scale_x)
                             cy = int((y1 + y2) / 2 * scale_y)
 
+                            # Draw Bounding Box (Rectangle)
+                            cv2.rectangle(f_ovl, (int(x1*scale_x), int(y1*scale_y)), 
+                                          (int(x2*scale_x), int(y2*scale_y)), f_color[::-1], 2)
                             cv2.circle(f_ovl, (cx, cy), 15, (255, 255, 255), 2)
                             cv2.circle(f_ovl, (cx, cy), 12, f_color[::-1], -1)
                             cv2.drawMarker(
@@ -490,6 +551,71 @@ def main():
                             )
 
                     st.image(f_ovl.astype(np.uint8), width="stretch")
+
+            with tab_compare:
+                st.subheader("Professional Precision Verification")
+                
+                comp_mode = st.radio("Comparison Mode", ["Side-by-Side", "Interactive Swipe (Opacity)"], horizontal=True)
+                
+                available = [k for k in FEATURES.keys() if k in results]
+                if not available:
+                    st.info("Run extraction to compare layers.")
+                else:
+                    target_layer = st.selectbox(
+                        "Layer to Verify",
+                        available,
+                        format_func=lambda x: FEATURES[x][0],
+                        key="compare_layer"
+                    )
+                    
+                    f_name, f_color = FEATURES[target_layer]
+                    m_raw = results[target_layer]
+                    
+                    # Pre-process mask for high-quality display
+                    is_point = "point" in target_layer.lower()
+                    if is_point:
+                        kernel = np.ones((5, 5), np.uint8)
+                        m_raw = cv2.dilate(m_raw.astype(np.float32), kernel, iterations=2)
+                    
+                    m_disp = cv2.resize(
+                        m_raw,
+                        (thumb.shape[1], thumb.shape[0]),
+                        interpolation=cv2.INTER_NEAREST if target_layer == "roof_type_mask" or is_point else cv2.INTER_LINEAR
+                    )
+
+                    if comp_mode == "Side-by-Side":
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.caption("Original Image")
+                            st.image(thumb.astype(np.uint8), use_container_width=True)
+                        with c2:
+                            st.caption(f"AI Extraction: {f_name}")
+                            # Create a clean mask overlay on black background
+                            mask_view = np.zeros_like(thumb)
+                            binary = m_disp > threshold
+                            for i in range(3):
+                                mask_view[binary, i] = f_color[i]
+                            st.image(mask_view, use_container_width=True)
+                    else:
+                        # Interactive Swipe style with opacity slider
+                        swipe_alpha = st.slider("Verification Opacity (Swipe)", 0.0, 1.0, 0.5)
+                        
+                        f_ovl = thumb.copy().astype(np.float32)
+                        is_roof = target_layer == "roof_type_mask"
+                        bin_mask = m_disp > 0 if is_roof else m_disp > threshold
+                        
+                        if is_roof:
+                            import matplotlib.pyplot as plt
+                            cmap = plt.get_cmap("tab10")
+                            c_roof = (cmap(m_disp)[:, :, :3] * 255).astype(np.uint8)
+                            f_ovl[bin_mask] = (f_ovl[bin_mask] * (1 - swipe_alpha) + c_roof[bin_mask] * swipe_alpha)
+                        else:
+                            for i in range(3):
+                                f_ovl[bin_mask, i] = (f_ovl[bin_mask, i] * (1 - swipe_alpha) + f_color[i] * swipe_alpha)
+                                
+                        st.image(f_ovl.astype(np.uint8), use_container_width=True, caption=f"Verification View: {f_name} (Opacity: {swipe_alpha*100:.0f}%)")
+                        
+                        st.info("💡 **Pro-Tip**: Use the slider above to 'dim' the AI mask and verify if the vectors exactly match the drone orthophoto boundaries.")
 
 
 if __name__ == "__main__":
